@@ -1,0 +1,15 @@
+# RL 版 Hello World：N 级倒立摆
+
+## Basic Intro
+
+- 使用 PPO 算法， actor 和 critic 是两个完全无关的 Net 。
+- 调参不说了。
+- Net 使用 $f(x)\pm f(-x)$ 构造奇偶函数后得以达到训练目标，此前烂泥扶不上墙。
+
+## __Version 1 Pole__
+
+- 可以在从任意角度回归到两个 0 阶量全 0 ，符合最好的想象。
+
+## __Version 2 Poles__
+
+- 目前做不到从任意角度回归，仅能做到从小的 0 阶扰动回归。
