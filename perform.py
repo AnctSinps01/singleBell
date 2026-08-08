@@ -87,7 +87,7 @@ def render_setup(ax, n_poles, l_poles, x_threshold):
     ax.set_aspect('equal')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    ax.set_title(f'{n_poles}-Pendulum PPO Inference (Fixed 2048 Steps)')
+    ax.set_title(f'{n_poles}-Pendulum PPO Inference (Fixed Steps)')
 
     # 用于动态更新的引用
     elements = {

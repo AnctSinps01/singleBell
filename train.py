@@ -16,7 +16,7 @@ class PPOAgent:
         self,
         history_length=4,
         n_poles=2,
-        lr=5e-5,
+        lr=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_coef=0.1,
@@ -201,10 +201,14 @@ def train_ppo():
 
     env = NPendulumEnv(n=n_poles)
     stacker = FrameStacker(history_length=history_length)
-    agent = PPOAgent(history_length=history_length, n_poles=n_poles)
+    agent = PPOAgent(
+        history_length=history_length,
+        n_poles=n_poles,
+        lr=3e-4
+    )
 
     total_iterations = 10000  # 总更新次数 (Iteration)
-    steps_per_update = 2000  # 每次更新收集的步数
+    steps_per_update = 500  # 每次更新收集的步数
 
     global_step = 0
 
