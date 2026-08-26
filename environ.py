@@ -8,7 +8,6 @@ class NPendulumEnv:
         self.dt = 0.01
         self.max_force = 50.0
         self.x_threshold = 2.0
-        self.theta_threshold = 0.78
         
         self.m_cart = 1.0
         self.m_poles = np.array([1.0] * n)
@@ -37,7 +36,7 @@ class NPendulumEnv:
                 raise ValueError("Wrong Dim With Angle Reset !")
             self.q[1:] = np.array(ang)
         else:
-            if 1:
+            if 0:
                 diff = 0.05
             else:
                 diff = np.pi

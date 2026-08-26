@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
 
-from actor import ActorNetwork
-from critic import CriticNetwork
+from PPO.actor import ActorNetwork
+from PPO.critic import CriticNetwork
 from frame_stack import FrameStacker
 from environ import NPendulumEnv
 from settings import Settings

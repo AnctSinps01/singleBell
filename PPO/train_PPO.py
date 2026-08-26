@@ -3,8 +3,8 @@ import torch.nn as nn
 import numpy as np
 import torch.optim as optim
 
-from actor import ActorNetwork
-from critic import CriticNetwork
+from PPO.actor import ActorNetwork
+from PPO.critic import CriticNetwork
 from frame_stack import FrameStacker
 from environ import NPendulumEnv
 from settings import Settings
