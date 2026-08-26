@@ -1,26 +1,70 @@
+import argparse
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Circle
+from matplotlib.patches import Rectangle
 
 from PPO.actor import ActorNetwork
-from PPO.critic import CriticNetwork
+from TQC.actor import TQCActor
 from frame_stack import FrameStacker
 from environ import NPendulumEnv
 from settings import Settings
 
 
-def load_models(actor_path, critic_path, history_length=4, n_poles=2, device='cpu'):
-    """加载训练好的 Actor 和 Critic 网络"""
-    actor = ActorNetwork(history_length=history_length, n_poles=n_poles)
-    actor.load_state_dict(torch.load(actor_path, map_location=device))
-    actor.eval()  # 切换到评估模式（关闭 dropout / batchnorm 等）
+class Policy:
+    def __init__(self, actor, algorithm, device):
+        self.actor = actor
+        self.algorithm = algorithm
+        self.device = device
 
-    critic = CriticNetwork(history_length=history_length, n_poles=n_poles)
-    critic.load_state_dict(torch.load(critic_path, map_location=device))
-    critic.eval()
+    def select_action(self, state, deterministic=True):
+        state = state.to(self.device)
+        with torch.no_grad():
+            if self.algorithm == "ppo":
+                if deterministic:
+                    mu, _ = self.actor(state)
+                    action = torch.tanh(mu)
+                else:
+                    action, _, _ = self.actor.get_action_and_log_prob(state)
+            else:
+                action = self.actor.act(state, deterministic=deterministic)
+        return action.cpu().item()
 
-    return actor, critic
+
+def load_actor(
+    algorithm,
+    actor_path,
+    history_length=4,
+    n_poles=2,
+    device="cpu",
+):
+    """加载 PPO 或 TQC actor，不依赖对应 critic。"""
+    algorithm = algorithm.lower()
+    if algorithm == "ppo":
+        actor = ActorNetwork(
+            history_length=history_length,
+            n_poles=n_poles,
+        )
+    elif algorithm == "tqc":
+        input_dim = history_length * (1 + n_poles)
+        actor = TQCActor(input_dim=input_dim, action_dim=1)
+    else:
+        raise ValueError(f"unsupported algorithm: {algorithm}")
+
+    checkpoint = torch.load(actor_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and "actor" in checkpoint:
+        checkpoint = checkpoint["actor"]
+    actor.load_state_dict(checkpoint)
+    actor.to(device)
+    actor.eval()
+    return Policy(actor, algorithm, device)
 
 
 def compute_positions(q, l_poles):
@@ -50,7 +94,7 @@ def compute_positions(q, l_poles):
     return np.array(x_nodes), np.array(y_nodes)
 
 
-def render_setup(ax, n_poles, l_poles, x_threshold):
+def render_setup(ax, algorithm, n_poles, l_poles, x_threshold):
     """初始化 matplotlib 绘图元素，返回需要动态更新的对象引用"""
     # 轨道
     ax.axhline(y=0, color='gray', linewidth=2, linestyle='-', alpha=0.5)
@@ -87,7 +131,7 @@ def render_setup(ax, n_poles, l_poles, x_threshold):
     ax.set_aspect('equal')
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    ax.set_title(f'{n_poles}-Pendulum PPO Inference (Fixed Steps)')
+    ax.set_title(f'{n_poles}-Pendulum {algorithm.upper()} Inference')
 
     # 用于动态更新的引用
     elements = {
@@ -100,11 +144,14 @@ def render_setup(ax, n_poles, l_poles, x_threshold):
     return elements
 
 
-def run_inference(actor_path='actor.pth',
-                  critic_path='critic.pth',
-                  n_poles=2,
-                  history_length=4,
-                  deterministic=True):
+def run_inference(
+    actor_path,
+    algorithm="ppo",
+    n_poles=2,
+    history_length=4,
+    deterministic=True,
+    max_steps=2000,
+):
     """
     主推理循环：固定运行 xxxx 步；
     deterministic=True 时使用均值动作（无探索），否则从分布采样。
@@ -112,8 +159,14 @@ def run_inference(actor_path='actor.pth',
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
-    # 1. 加载模型
-    actor, critic = load_models(actor_path, critic_path, history_length, n_poles, device)
+    # 1. 只加载 actor
+    policy = load_actor(
+        algorithm,
+        actor_path,
+        history_length,
+        n_poles,
+        device,
+    )
 
     # 2. 初始化环境与帧堆叠器
     env = NPendulumEnv(n=n_poles)
@@ -122,33 +175,24 @@ def run_inference(actor_path='actor.pth',
     # 3. 设置 matplotlib
     plt.ion()  # 交互模式
     fig, ax = plt.subplots(figsize=(8, 6))
-    elements = render_setup(ax, n_poles, env.l_poles, env.x_threshold)
+    elements = render_setup(
+        ax,
+        algorithm,
+        n_poles,
+        env.l_poles,
+        env.x_threshold,
+    )
 
     # 4. 状态变量
     obs = env.reset()
     state_tensor = stacker.reset(obs)
     episode_reward = 0.0
     step_count = 0
-    max_steps = 2000
-
     print(f"Starting inference for fixed {max_steps} steps... Close the plot window to exit early.")
     print(f"Deterministic mode: {deterministic}")
 
     while plt.fignum_exists(fig.number) and step_count < max_steps:
-        # --- 用 Actor 获取动作 ---
-        with torch.no_grad():
-            state_tensor = state_tensor.to(device)
-            if deterministic:
-                # 直接取 mean，经过 tanh 得到确定性动作
-                mu, _ = actor.forward(state_tensor)
-                action = torch.tanh(mu).cpu().item()
-            else:
-                # 从分布采样（带探索的随机动作）
-                action_tensor, _, _ = actor.get_action_and_log_prob(state_tensor)
-                action = action_tensor.cpu().item()
-
-            # 顺便获取 value（仅用于显示）
-            value = critic(state_tensor).cpu().item()
+        action = policy.select_action(state_tensor, deterministic)
 
         # --- 环境步进 (直接忽略 returned done 标志) ---
         next_obs, reward = env.step(action)
@@ -176,7 +220,6 @@ def run_inference(actor_path='actor.pth',
         info_str = (f"Step: {step_count}/{max_steps}\n"
                     f"Reward: {episode_reward:.3f}\n"
                     f"Action: {action:+.3f}\n"
-                    f"Value:  {value:+.3f}\n"
                     f"Cart x: {env.q[0]:+.3f}\n"
                     f"Max θ:  {np.max(np.abs(env.q[1:])):.3f} rad")
         elements['info_text'].set_text(info_str)
@@ -192,16 +235,33 @@ def run_inference(actor_path='actor.pth',
     print(f"Inference finished. Total Steps: {step_count}, Cumulative Reward: {episode_reward:.3f}")
 
 
-SET = Settings()
-n_poles = SET.POLES
-his = SET.HISTORY
-STOCHASTIC = False   # True = 随机采样，False = 确定性策略
+def parse_args():
+    settings = Settings()
+    parser = argparse.ArgumentParser(description="Render a trained actor.")
+    parser.add_argument("--algorithm", choices=("ppo", "tqc"), default="ppo")
+    parser.add_argument("--actor-path", type=Path)
+    parser.add_argument("--n-poles", type=int, default=settings.POLES)
+    parser.add_argument("--history-length", type=int, default=settings.HISTORY)
+    parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument("--stochastic", action="store_true")
+    return parser.parse_args()
+
+
+def default_actor_path(algorithm, n_poles):
+    if algorithm == "ppo":
+        return PROJECT_ROOT / "PPO" / f"actor_{n_poles}.pth"
+    return PROJECT_ROOT / "TQC" / f"tqc_actor_{n_poles}.pth"
 
 if __name__ == "__main__":
+    args = parse_args()
+    actor_path = args.actor_path or default_actor_path(
+        args.algorithm, args.n_poles
+    )
     run_inference(
-        actor_path=f"actor_{n_poles}.pth",
-        critic_path=f"critic_{n_poles}.pth",
-        n_poles=n_poles,
-        history_length=his,
-        deterministic=not STOCHASTIC,
+        actor_path=actor_path,
+        algorithm=args.algorithm,
+        n_poles=args.n_poles,
+        history_length=args.history_length,
+        deterministic=not args.stochastic,
+        max_steps=args.max_steps,
     )

@@ -1,3 +1,11 @@
+import argparse
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import torch.optim as optim
 import numpy as np
@@ -70,6 +78,67 @@ class TQCAgent:
     @property
     def alpha(self):
         return self.log_alpha.exp()
+
+    def checkpoint_state(self, step, best_eval_reward):
+        return {
+            "version": 1,
+            "step": int(step),
+            "best_eval_reward": float(best_eval_reward),
+            "agent_config": {
+                "state_dim": self.state_dim,
+                "action_dim": self.action_dim,
+                "n_nets": self.n_nets,
+                "n_quantiles": self.n_quantiles,
+                "top_quantiles_to_drop": self.top_quantiles_to_drop,
+                "gamma": self.gamma,
+                "tau": self.tau,
+            },
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "log_alpha": self.log_alpha.detach().cpu(),
+            "alpha_optimizer": self.alpha_optimizer.state_dict(),
+        }
+
+    def save_checkpoint(self, path, step, best_eval_reward):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.checkpoint_state(step, best_eval_reward), path)
+
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(
+            path, map_location=self.device, weights_only=False
+        )
+        config = checkpoint.get("agent_config", {})
+        expected = {
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "n_nets": self.n_nets,
+            "n_quantiles": self.n_quantiles,
+        }
+        mismatches = {
+            key: (config.get(key), value)
+            for key, value in expected.items()
+            if config.get(key, value) != value
+        }
+        if mismatches:
+            raise ValueError(f"checkpoint configuration mismatch: {mismatches}")
+
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.critic_target.load_state_dict(checkpoint["critic_target"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+        self.log_alpha.data.copy_(checkpoint["log_alpha"].to(self.device))
+        self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
+        return {
+            "step": int(checkpoint.get("step", 0)),
+            "best_eval_reward": float(
+                checkpoint.get("best_eval_reward", -float("inf"))
+            ),
+        }
 
     def select_action(self, state, evaluate=False):
         state = torch.as_tensor(
@@ -222,7 +291,7 @@ def evaluate_agent(agent, env, history_length, n_poles, eval_steps=500):
     return total_eval_reward / (len(test_angles) * eval_steps)
 
 
-def train_tqc():
+def train_tqc(resume_path=None, max_steps=2_000_000):
     SET = Settings()
     n_poles = SET.POLES
     history_length = SET.HISTORY
@@ -237,22 +306,31 @@ def train_tqc():
     
     # 论文设定经验回放池 1e6
     replay_buffer = ReplayBuffer(capacity=1000000)
-    
-    max_steps = 2_000_000
+
     batch_size = 256
     start_steps = 10000 # 初始随机探索步数
     eval_interval = 5000 # 评估间隔步数
-    
+
+    model_dir = Path(__file__).resolve().parent
+    actor_path = model_dir / f"tqc_actor_{n_poles}.pth"
+    checkpoint_path = model_dir / f"tqc_checkpoint_{n_poles}.pth"
     obs = env.reset()
     state = stacker.reset(obs).squeeze(0).numpy()
-    
+
     best_eval_reward = -float('inf')
+    initial_step = 0
+    if resume_path is not None:
+        resume_state = agent.load_checkpoint(resume_path)
+        initial_step = resume_state["step"]
+        best_eval_reward = resume_state["best_eval_reward"]
+        print(f"Resumed TQC checkpoint at step {initial_step}.")
+
     episode_reward = 0
     episode_length = 0
-    
-    for t in range(max_steps):
+
+    for t in range(initial_step, max_steps):
         # 1. 探索与收集数据
-        if t < start_steps:
+        if len(replay_buffer) < start_steps:
             action = np.random.uniform(-1, 1)
         else:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -280,7 +358,7 @@ def train_tqc():
             episode_length = 0
             
         # 2. 网络更新 (每次环境步执行一次更新，论文中 Gradient steps = 1)
-        if t >= start_steps:
+        if len(replay_buffer) >= max(start_steps, batch_size):
             agent.update(replay_buffer, batch_size=batch_size)
             
         # 3. 评估与保存
@@ -299,9 +377,22 @@ def train_tqc():
             
             if current_eval_reward > best_eval_reward:
                 best_eval_reward = current_eval_reward
-                torch.save(agent.actor.state_dict(), f"tqc_actor_{n_poles}.pth")
-                torch.save(agent.critic.state_dict(), f"tqc_critic_{n_poles}.pth")
+                torch.save(agent.actor.state_dict(), actor_path)
                 print(f">>> New Best Model Saved with Score: {best_eval_reward:.4f} <<<\n")
 
+            agent.save_checkpoint(
+                checkpoint_path,
+                step=t + 1,
+                best_eval_reward=best_eval_reward,
+            )
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a TQC agent.")
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--max-steps", type=int, default=2_000_000)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    train_tqc()
+    args = parse_args()
+    train_tqc(resume_path=args.resume, max_steps=args.max_steps)
