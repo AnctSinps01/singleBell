@@ -1,4 +1,5 @@
 import argparse
+from itertools import product
 from pathlib import Path
 import sys
 
@@ -79,11 +80,19 @@ class TQCAgent:
     def alpha(self):
         return self.log_alpha.exp()
 
-    def checkpoint_state(self, step, best_eval_reward):
+    def checkpoint_state(
+        self,
+        step,
+        best_eval_reward,
+        best_success_rate=-1.0,
+        best_worst_reward=-float("inf"),
+    ):
         return {
             "version": 1,
             "step": int(step),
             "best_eval_reward": float(best_eval_reward),
+            "best_success_rate": float(best_success_rate),
+            "best_worst_reward": float(best_worst_reward),
             "agent_config": {
                 "state_dim": self.state_dim,
                 "action_dim": self.action_dim,
@@ -102,10 +111,25 @@ class TQCAgent:
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
         }
 
-    def save_checkpoint(self, path, step, best_eval_reward):
+    def save_checkpoint(
+        self,
+        path,
+        step,
+        best_eval_reward,
+        best_success_rate=-1.0,
+        best_worst_reward=-float("inf"),
+    ):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.checkpoint_state(step, best_eval_reward), path)
+        torch.save(
+            self.checkpoint_state(
+                step,
+                best_eval_reward,
+                best_success_rate,
+                best_worst_reward,
+            ),
+            path,
+        )
 
     def load_checkpoint(self, path):
         checkpoint = torch.load(
@@ -137,6 +161,12 @@ class TQCAgent:
             "step": int(checkpoint.get("step", 0)),
             "best_eval_reward": float(
                 checkpoint.get("best_eval_reward", -float("inf"))
+            ),
+            "best_success_rate": float(
+                checkpoint.get("best_success_rate", -1.0)
+            ),
+            "best_worst_reward": float(
+                checkpoint.get("best_worst_reward", -float("inf"))
             ),
         }
 
@@ -267,28 +297,129 @@ class TQCAgent:
 # ==========================================
 # 5. 训练主循环 (Off-Policy 方式)
 # ==========================================
-def evaluate_agent(agent, env, history_length, n_poles, eval_steps=500):
-    """测试评估环境性能"""
-    test_angles = np.linspace(-np.pi, np.pi, 24, endpoint=False)
-    total_eval_reward = 0.0
-    eval_stacker = FrameStacker(history_length=history_length)
+def build_evaluation_cases(
+    n_poles,
+    diagonal_cases=8,
+    random_cases=8,
+    seed=0,
+):
+    """构造覆盖平衡点、耦合姿态和独立姿态的固定评估集。"""
+    cases = []
 
-    for base_ang in test_angles:
-        ang_vector = [base_ang] * n_poles
-        obs = env.reset(ang=ang_vector)
+    for angles in product((0.0, np.pi), repeat=n_poles):
+        cases.append(("equilibrium", np.asarray(angles, dtype=np.float64)))
+
+    diagonal_angles = np.linspace(
+        -np.pi, np.pi, diagonal_cases, endpoint=False
+    )
+    for angle in diagonal_angles:
+        cases.append(
+            ("diagonal", np.full(n_poles, angle, dtype=np.float64))
+        )
+
+    rng = np.random.default_rng(seed)
+    for angles in rng.uniform(-np.pi, np.pi, (random_cases, n_poles)):
+        cases.append(("random", angles))
+
+    return cases
+
+
+def evaluate_agent(
+    agent,
+    env,
+    history_length,
+    n_poles,
+    eval_steps=500,
+    success_window=100,
+):
+    """在固定初态集上评估回零性能，返回奖励和控制质量指标。"""
+    cases = build_evaluation_cases(n_poles)
+    eval_stacker = FrameStacker(history_length=history_length)
+    episodes = []
+
+    for suite, angles in cases:
+        obs = env.reset(ang=angles.tolist())
         state_tensor = eval_stacker.reset(obs)
-        ep_reward = 0.0
+        rewards = []
+        actions = []
+        stable = []
 
         for _ in range(eval_steps):
-            # evaluate=True 会取均值而不采样，动作更稳定
             action = agent.select_action(state_tensor, evaluate=True).item()
             next_obs, reward = env.step(action)
             state_tensor = eval_stacker.push(next_obs)
-            ep_reward += reward
+            rewards.append(reward)
+            actions.append(abs(action))
+            stable.append(
+                abs(env.q[0]) <= 0.2
+                and np.max(np.abs(env.q[1:])) <= np.deg2rad(10.0)
+                and abs(env.dq[0]) <= 0.5
+                and np.max(np.abs(env.dq[1:])) <= 0.5
+            )
 
-        total_eval_reward += ep_reward
+        window = min(success_window, eval_steps)
+        episodes.append(
+            {
+                "suite": suite,
+                "mean_reward": float(np.mean(rewards)),
+                "success": bool(np.all(stable[-window:])),
+                "final_angle_error": float(
+                    np.max(np.abs(env.q[1:]))
+                ),
+                "final_cart_error": float(abs(env.q[0])),
+                "mean_action": float(np.mean(actions)),
+            }
+        )
 
-    return total_eval_reward / (len(test_angles) * eval_steps)
+    suite_success = {}
+    for suite in sorted({episode["suite"] for episode in episodes}):
+        suite_episodes = [
+            episode for episode in episodes if episode["suite"] == suite
+        ]
+        suite_success[suite] = float(
+            np.mean([episode["success"] for episode in suite_episodes])
+        )
+
+    return {
+        "mean_reward": float(
+            np.mean([episode["mean_reward"] for episode in episodes])
+        ),
+        "worst_reward": float(
+            np.min([episode["mean_reward"] for episode in episodes])
+        ),
+        "success_rate": float(
+            np.mean([episode["success"] for episode in episodes])
+        ),
+        "mean_final_angle_error": float(
+            np.mean(
+                [episode["final_angle_error"] for episode in episodes]
+            )
+        ),
+        "mean_final_cart_error": float(
+            np.mean([episode["final_cart_error"] for episode in episodes])
+        ),
+        "mean_action": float(
+            np.mean([episode["mean_action"] for episode in episodes])
+        ),
+        "suite_success": suite_success,
+        "episodes": len(episodes),
+    }
+
+
+def format_evaluation(result):
+    suite_text = ", ".join(
+        f"{name}={rate:.0%}"
+        for name, rate in result["suite_success"].items()
+    )
+    return (
+        f"reward={result['mean_reward']:.4f} | "
+        f"worst={result['worst_reward']:.4f} | "
+        f"success={result['success_rate']:.1%} | "
+        f"angle={np.rad2deg(result['mean_final_angle_error']):.2f} deg | "
+        f"cart={result['mean_final_cart_error']:.3f} | "
+        f"|action|={result['mean_action']:.3f} | "
+        f"suites: {suite_text}"
+    )
 
 
 def train_tqc(resume_path=None, max_steps=2_000_000):
@@ -318,11 +449,15 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
     state = stacker.reset(obs).squeeze(0).numpy()
 
     best_eval_reward = -float('inf')
+    best_success_rate = -1.0
+    best_worst_reward = -float("inf")
     initial_step = 0
     if resume_path is not None:
         resume_state = agent.load_checkpoint(resume_path)
         initial_step = resume_state["step"]
         best_eval_reward = resume_state["best_eval_reward"]
+        best_success_rate = resume_state["best_success_rate"]
+        best_worst_reward = resume_state["best_worst_reward"]
         print(f"Resumed TQC checkpoint at step {initial_step}.")
 
     episode_reward = 0
@@ -364,26 +499,46 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
         # 3. 评估与保存
         if t % eval_interval == 0 and t >= start_steps:
             print("\n--- Running Fixed Angle Evaluation ---")
-            current_eval_reward = evaluate_agent(
+            evaluation = evaluate_agent(
                 agent,
                 eval_env,
                 history_length,
                 n_poles,
             )
+            current_eval_reward = evaluation["mean_reward"]
             print(
-                f"Step {t} | Eval Score: {current_eval_reward:.4f} "
-                f"| Best So Far: {best_eval_reward:.4f}"
+                f"Step {t} | {format_evaluation(evaluation)} | "
+                f"best_success={best_success_rate:.1%} | "
+                f"best_reward={best_eval_reward:.4f}"
             )
-            
-            if current_eval_reward > best_eval_reward:
+
+            current_rank = (
+                evaluation["success_rate"],
+                current_eval_reward,
+                evaluation["worst_reward"],
+            )
+            best_rank = (
+                best_success_rate,
+                best_eval_reward,
+                best_worst_reward,
+            )
+            if current_rank > best_rank:
+                best_success_rate = evaluation["success_rate"]
                 best_eval_reward = current_eval_reward
+                best_worst_reward = evaluation["worst_reward"]
                 torch.save(agent.actor.state_dict(), actor_path)
-                print(f">>> New Best Model Saved with Score: {best_eval_reward:.4f} <<<\n")
+                print(
+                    ">>> New best actor saved: "
+                    f"success={best_success_rate:.1%}, "
+                    f"reward={best_eval_reward:.4f} <<<\n"
+                )
 
             agent.save_checkpoint(
                 checkpoint_path,
                 step=t + 1,
                 best_eval_reward=best_eval_reward,
+                best_success_rate=best_success_rate,
+                best_worst_reward=best_worst_reward,
             )
 
 def parse_args():

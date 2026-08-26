@@ -132,7 +132,7 @@ class NPendulumEnv:
         
         # 奖励设计
         angle_penalty = np.sum(np.abs(self.q))
-        reward = np.exp(-angle_penalty) - 0.5
+        reward = np.exp(-0.3 * angle_penalty)
         
         # out_of_bounds = bool(abs(self.q[0]) > self.x_threshold)
         # fallen = bool(np.any(np.abs(self.q[1:]) > self.theta_threshold))
