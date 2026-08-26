@@ -11,50 +11,87 @@ from TQC.critics import TQCCritic
 
 
 class TQCAgent:
-    def __init__(self, history_length, n_poles, lr=3e-4, gamma=0.99, tau=0.005):
+    def __init__(
+        self,
+        history_length,
+        n_poles,
+        lr=3e-4,
+        gamma=0.99,
+        tau=0.005,
+        n_nets=3,
+        n_quantiles=25,
+        top_quantiles_to_drop=5,
+        device=None,
+    ):
         self.gamma = gamma
         self.tau = tau
-        
-        state_dim = history_length * (1 + n_poles)
-        action_dim = 1
-        
-        # 论文参数设置
-        self.n_nets = 3
-        self.n_quantiles = 25
-        # 截断（Truncation）：丢弃预测最高的一部分分位数，防止过估计
-        self.top_quantiles_to_drop = 5 
-        
-        # 建立网络
-        self.actor = TQCActor(state_dim, action_dim)
-        self.critic = TQCCritic(state_dim, action_dim, self.n_nets, self.n_quantiles)
-        self.critic_target = TQCCritic(state_dim, action_dim, self.n_nets, self.n_quantiles)
-        
-        # 初始化 Target 网络权重
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        self.state_dim = history_length * (1 + n_poles)
+        self.action_dim = 1
+        self.n_nets = n_nets
+        self.n_quantiles = n_quantiles
+        self.top_quantiles_to_drop = top_quantiles_to_drop
+        self.total_quantiles = n_nets * n_quantiles
+
+        if not 0 <= top_quantiles_to_drop < self.total_quantiles:
+            raise ValueError(
+                "top_quantiles_to_drop must be in "
+                f"[0, {self.total_quantiles})"
+            )
+
+        self.actor = TQCActor(self.state_dim, self.action_dim).to(self.device)
+        self.critic = TQCCritic(
+            self.state_dim,
+            self.action_dim,
+            self.n_nets,
+            self.n_quantiles,
+        ).to(self.device)
+        self.critic_target = TQCCritic(
+            self.state_dim,
+            self.action_dim,
+            self.n_nets,
+            self.n_quantiles,
+        ).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
-        
-        # 优化器
+        self.critic_target.requires_grad_(False)
+
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
-        
-        # 自动调整温度系数 Alpha
-        self.target_entropy = -action_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True)
+
+        self.target_entropy = -float(self.action_dim)
+        self.log_alpha = torch.zeros(
+            1, device=self.device, requires_grad=True
+        )
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
-        
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
+
     def select_action(self, state, evaluate=False):
-        state = state.float()
+        state = torch.as_tensor(
+            state, dtype=torch.float32, device=self.device
+        )
+        if state.ndim in (1, 2):
+            state = state.unsqueeze(0)
+
         with torch.no_grad():
-            if evaluate:
-                mu, _ = self.actor(state)
-                return torch.tanh(mu).item()
-            else:
-                action, _ = self.actor.sample(state)
-                return action.item()
+            action = self.actor.act(state, deterministic=evaluate)
+        return action.squeeze(0).cpu().numpy()
 
     def quantile_huber_loss(self, quantiles, target):
         """计算分位数 Huber 损失 (Quantile Huber Loss)"""
         # quantiles: (batch, n_nets, n_quantiles)
         # target: (batch, total_quantiles - drop)
+        if quantiles.ndim != 3:
+            raise ValueError("quantiles must have shape (B, N, M)")
+        if target.ndim != 2:
+            raise ValueError("target must have shape (B, target_quantiles)")
+        if quantiles.size(0) != target.size(0):
+            raise ValueError("quantiles and target batch sizes must match")
         
         # 扩展维度以便进行广播计算 pairwise 差距
         # target 扩展为 (batch, 1, 1, target_quantiles)
@@ -67,36 +104,53 @@ class TQCAgent:
         # Huber 损失计算
         kappa = 1.0
         abs_u = torch.abs(pairwise_delta)
-        huber_loss = torch.where(abs_u <= kappa, 0.5 * abs_u.pow(2), kappa * (abs_u - 0.5 * kappa))
+        huber_loss = torch.where(
+            abs_u <= kappa,
+            0.5 * abs_u.pow(2),
+            kappa * (abs_u - 0.5 * kappa),
+        )
         
         # 分位数权重 \tau
-        tau = (torch.arange(self.n_quantiles, dtype=torch.float32) + 0.5) / self.n_quantiles
+        tau = (
+            torch.arange(
+                self.n_quantiles,
+                dtype=quantiles.dtype,
+                device=quantiles.device,
+            )
+            + 0.5
+        ) / self.n_quantiles
         tau = tau.view(1, 1, self.n_quantiles, 1)
         
         # 分位数回归损失
-        loss = (torch.abs(tau - (pairwise_delta.detach() < 0).float()) * huber_loss).mean()
+        quantile_weight = torch.abs(
+            tau - (pairwise_delta.detach() < 0).to(quantiles.dtype)
+        )
+        loss = (quantile_weight * huber_loss).mean()
         return loss
 
     def update(self, replay_buffer, batch_size=256):
-        state, action, reward, next_state, done = replay_buffer.sample(batch_size)
-        
-        alpha = self.log_alpha.exp()
-        
+        if len(replay_buffer) < batch_size:
+            raise ValueError(
+                f"update requires {batch_size} transitions, "
+                f"but the replay buffer contains {len(replay_buffer)}"
+            )
+
+        state, action, reward, next_state, done = replay_buffer.sample(
+            batch_size, device=self.device
+        )
+
         # ---------------- 1. 更新 Critic ----------------
         with torch.no_grad():
             next_action, next_log_prob = self.actor.sample(next_state)
-            # 获取下一个状态的分位数 (Batch, 3, 25)
             next_quantiles = self.critic_target(next_state, next_action)
-            
-            # 将所有网络的分位数合并并排序 (Batch, 75)
-            next_quantiles, _ = torch.sort(next_quantiles.view(batch_size, -1), dim=1)
-            
-            # **TQC 核心操作：截断 (Truncation)**
-            # 丢弃最高的那几个分位数，抑制过估计
-            target_quantiles = next_quantiles[:, : self.n_nets * self.n_quantiles - self.top_quantiles_to_drop]
-            
-            # 结合奖励与熵 (Batch, 70)
-            target = reward + (1 - done) * self.gamma * (target_quantiles - alpha * next_log_prob)
+            sorted_quantiles = torch.sort(
+                next_quantiles.flatten(start_dim=1), dim=1
+            ).values
+            kept_quantiles = self.total_quantiles - self.top_quantiles_to_drop
+            target_quantiles = sorted_quantiles[:, :kept_quantiles]
+            target = reward + (1.0 - done) * self.gamma * (
+                target_quantiles - self.alpha.detach() * next_log_prob
+            )
 
         # 当前 Critic 预测 (Batch, 3, 25)
         current_quantiles = self.critic(state, action)
@@ -107,27 +161,38 @@ class TQCAgent:
         self.critic_optimizer.step()
         
         # ---------------- 2. 更新 Actor ----------------
+        self.critic.requires_grad_(False)
         new_action, log_prob = self.actor.sample(state)
-        # 获取当前新动作的分位数评估
         actor_quantiles = self.critic(state, new_action)
-        # TQC 建议 actor 优化时使用各网络均值来指导
-        actor_q = actor_quantiles.mean(dim=2).mean(dim=1, keepdim=True)
-        
-        actor_loss = (alpha * log_prob - actor_q).mean()
-        
+        actor_q = actor_quantiles.mean(dim=(1, 2), keepdim=False).unsqueeze(1)
+        actor_loss = (self.alpha.detach() * log_prob - actor_q).mean()
+
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
-        
+        self.critic.requires_grad_(True)
+
         # ---------------- 3. 更新 Alpha (温度系数) ----------------
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+        alpha_loss = -(
+            self.log_alpha * (log_prob + self.target_entropy).detach()
+        ).mean()
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
         
         # ---------------- 4. 软更新 Target 网络 ----------------
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
+        with torch.no_grad():
+            for target_param, param in zip(
+                self.critic_target.parameters(), self.critic.parameters()
+            ):
+                target_param.lerp_(param, self.tau)
+
+        return {
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "alpha_loss": alpha_loss.item(),
+            "alpha": self.alpha.detach().item(),
+        }
 
 
 # ==========================================
@@ -135,24 +200,19 @@ class TQCAgent:
 # ==========================================
 def evaluate_agent(agent, env, history_length, n_poles, eval_steps=500):
     """测试评估环境性能"""
-    test_angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+    test_angles = np.linspace(-np.pi, np.pi, 24, endpoint=False)
     total_eval_reward = 0.0
     eval_stacker = FrameStacker(history_length=history_length)
 
     for base_ang in test_angles:
-        ang_vector = [] # 或者 [base_ang] * n_poles 根据你的需求
+        ang_vector = [base_ang] * n_poles
         obs = env.reset(ang=ang_vector)
-
-        for _ in range(history_length):
-            obs, _ = env.step(0.0)
-            eval_stacker.push(obs)
-
-        state_tensor = eval_stacker.get_stacked_state()
+        state_tensor = eval_stacker.reset(obs)
         ep_reward = 0.0
 
         for _ in range(eval_steps):
             # evaluate=True 会取均值而不采样，动作更稳定
-            action = agent.select_action(state_tensor, evaluate=True)
+            action = agent.select_action(state_tensor, evaluate=True).item()
             next_obs, reward = env.step(action)
             state_tensor = eval_stacker.push(next_obs)
             ep_reward += reward
@@ -169,6 +229,7 @@ def train_tqc():
     
     # 初始化环境
     env = NPendulumEnv(n=n_poles)
+    eval_env = NPendulumEnv(n=n_poles)
     stacker = FrameStacker(history_length=history_length)
     
     # 初始化 Agent (对应论文：N=3, M=25)
@@ -183,10 +244,7 @@ def train_tqc():
     eval_interval = 5000 # 评估间隔步数
     
     obs = env.reset()
-    for _ in range(history_length):
-        obs, _ = env.step(0.0)
-        stacker.push(obs)
-    state = stacker.get_stacked_state().squeeze(0).numpy() # (History * Features)
+    state = stacker.reset(obs).squeeze(0).numpy()
     
     best_eval_reward = -float('inf')
     episode_reward = 0
@@ -198,7 +256,7 @@ def train_tqc():
             action = np.random.uniform(-1, 1)
         else:
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            action = agent.select_action(state_tensor, evaluate=False)
+            action = agent.select_action(state_tensor, evaluate=False).item()
             
         next_obs, reward = env.step(action)
         stacker.push(next_obs)
@@ -217,10 +275,7 @@ def train_tqc():
         # 为了与 PPO 代码一致，这里强制每 1000 步重置一次环境（可自定义）
         if episode_length >= 1000:
             obs = env.reset()
-            for _ in range(history_length):
-                obs, _ = env.step(0.0)
-                stacker.push(obs)
-            state = stacker.get_stacked_state().squeeze(0).numpy()
+            state = stacker.reset(obs).squeeze(0).numpy()
             episode_reward = 0
             episode_length = 0
             
@@ -231,8 +286,16 @@ def train_tqc():
         # 3. 评估与保存
         if t % eval_interval == 0 and t >= start_steps:
             print("\n--- Running Fixed Angle Evaluation ---")
-            current_eval_reward = evaluate_agent(agent, env, history_length, n_poles)
-            print(f"Step {t} | Eval Score: {current_eval_reward:.4f} | Best So Far: {best_eval_reward:.4f}")
+            current_eval_reward = evaluate_agent(
+                agent,
+                eval_env,
+                history_length,
+                n_poles,
+            )
+            print(
+                f"Step {t} | Eval Score: {current_eval_reward:.4f} "
+                f"| Best So Far: {best_eval_reward:.4f}"
+            )
             
             if current_eval_reward > best_eval_reward:
                 best_eval_reward = current_eval_reward

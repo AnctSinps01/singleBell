@@ -5,27 +5,35 @@ import torch.nn as nn
 class TQCActor(nn.Module):
     def __init__(self, input_dim, action_dim=1):
         super(TQCActor, self).__init__()
+        self.input_dim = input_dim
+        self.action_dim = action_dim
+
         # 对应论文：隐藏层 400 -> 300
         self.net = nn.Sequential(
             nn.Linear(input_dim, 400),
             nn.ReLU(),
             nn.Linear(400, 300),
-            nn.ReLU()
+            nn.ReLU(),
         )
         self.mu_layer = nn.Linear(300, action_dim)
         self.log_std_layer = nn.Linear(300, action_dim)
         
-        self.LOG_STD_MAX = 2
-        self.LOG_STD_MIN = -20
+        self.log_std_max = 2.0
+        self.log_std_min = -20.0
 
     def forward(self, state):
         # Flatten state: (Batch, History, Features) -> (Batch, Input_dim)
-        x = state.view(state.size(0), -1)
+        x = state.reshape(state.size(0), -1)
+        if x.size(1) != self.input_dim:
+            raise ValueError(
+                f"expected flattened state dimension {self.input_dim}, "
+                f"got {x.size(1)}"
+            )
         net_out = self.net(x)
         
         mu = self.mu_layer(net_out)
         log_std = self.log_std_layer(net_out)
-        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         std = torch.exp(log_std)
         
         return mu, std
@@ -36,12 +44,18 @@ class TQCActor(nn.Module):
         
         # 重参数化采样 (rsample 允许梯度回传)
         x_t = normal.rsample()
-        y_t = torch.tanh(x_t) # 将动作限制在 [-1, 1]
-        action = y_t
+        action = torch.tanh(x_t)
         
         # 计算 log_prob，并修正由于 tanh 引起的概率变化
         log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1.0 - y_t.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
+        log_prob -= torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
         
         return action, log_prob
+
+    def act(self, state, deterministic=True):
+        if deterministic:
+            mu, _ = self.forward(state)
+            return torch.tanh(mu)
+        action, _ = self.sample(state)
+        return action
