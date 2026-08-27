@@ -97,7 +97,6 @@ class TQCAgent:
         n_nets=3,
         n_quantiles=25,
         top_quantiles_to_drop=5,
-        action_actor_sync_interval=100,
         device=None,
     ):
         self.gamma = gamma
@@ -105,11 +104,6 @@ class TQCAgent:
         self.device = (
             torch.device(device) if device else default_training_device()
         )
-        if action_actor_sync_interval <= 0:
-            raise ValueError("action_actor_sync_interval must be positive")
-        self.action_actor_sync_interval = action_actor_sync_interval
-        self.update_count = 0
-
         self.state_dim = 1 + 2 * n_poles
         self.action_dim = 1
         self.n_nets = n_nets
@@ -162,11 +156,12 @@ class TQCAgent:
     def sync_action_actor(self):
         if self.action_actor is self.actor:
             return
-        cpu_state = {
-            name: value.detach().cpu()
-            for name, value in self.actor.state_dict().items()
-        }
-        self.action_actor.load_state_dict(cpu_state)
+        self.action_actor.load_state_dict(
+            {
+                name: value.detach().cpu()
+                for name, value in self.actor.state_dict().items()
+            }
+        )
 
     @property
     def alpha(self):
@@ -181,7 +176,7 @@ class TQCAgent:
         training_state=None,
     ):
         return {
-            "version": 2,
+            "version": 3,
             "step": int(step),
             "best_eval_reward": float(best_eval_reward),
             "best_success_rate": float(best_success_rate),
@@ -195,22 +190,14 @@ class TQCAgent:
                 "gamma": self.gamma,
                 "tau": self.tau,
                 "target_entropy": self.target_entropy,
-                "action_actor_sync_interval": (
-                    self.action_actor_sync_interval
-                ),
             },
             "actor": self.actor.state_dict(),
-            "action_actor": {
-                name: value.detach().cpu()
-                for name, value in self.action_actor.state_dict().items()
-            },
             "critic": self.critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(),
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
-            "agent_update_count": self.update_count,
             "training_state": training_state,
         }
 
@@ -240,7 +227,7 @@ class TQCAgent:
         checkpoint = torch.load(
             path, map_location=self.device, weights_only=False
         )
-        if checkpoint.get("version") != 2:
+        if checkpoint.get("version") not in (2, 3):
             raise ValueError(
                 "checkpoint does not contain complete training state"
             )
@@ -256,7 +243,6 @@ class TQCAgent:
             "gamma": self.gamma,
             "tau": self.tau,
             "target_entropy": self.target_entropy,
-            "action_actor_sync_interval": self.action_actor_sync_interval,
         }
         mismatches = {
             key: (config.get(key), value)
@@ -273,8 +259,7 @@ class TQCAgent:
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.log_alpha.data.copy_(checkpoint["log_alpha"].to(self.device))
         self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
-        self.update_count = int(checkpoint["agent_update_count"])
-        self.action_actor.load_state_dict(checkpoint["action_actor"])
+        self.sync_action_actor()
         return {
             "step": int(checkpoint.get("step", 0)),
             "best_eval_reward": float(
@@ -378,6 +363,7 @@ class TQCAgent:
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
+        self.sync_action_actor()
         self.critic.requires_grad_(True)
 
         # ---------------- 3. 更新 Alpha (温度系数) ----------------
@@ -394,10 +380,6 @@ class TQCAgent:
                 self.critic_target.parameters(), self.critic.parameters()
             ):
                 target_param.lerp_(param, self.tau)
-
-        self.update_count += 1
-        if self.update_count % self.action_actor_sync_interval == 0:
-            self.sync_action_actor()
 
         return {
             "critic_loss": critic_loss.item(),
@@ -557,7 +539,7 @@ def train_tqc(
     agent = TQCAgent(n_poles, lr=3e-4, gamma=0.99, tau=0.005)
     print(
         f"Training device: {agent.device}; "
-        f"action collection device: cpu"
+        "action collection device: cpu (synchronized every actor update)"
     )
     
     # 论文设定经验回放池 1e6
@@ -662,7 +644,6 @@ def train_tqc(
         # 3. 评估与保存
         if t % eval_interval == 0 and t >= start_steps:
             print("\n--- Running Fixed Angle Evaluation ---")
-            agent.sync_action_actor()
             evaluation = evaluate_agent(
                 agent,
                 eval_env,
@@ -721,5 +702,8 @@ def train_tqc(
 
 
 if __name__ == "__main__":
-    # train_tqc("TQC/tqc_checkpoint_2.pth")
-    train_tqc()
+    train_tqc(
+        # "TQC/tqc_checkpoint_2.pth",
+        batch_size=256,
+        update_interval=1
+    )
