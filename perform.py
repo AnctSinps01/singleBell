@@ -57,7 +57,7 @@ def load_actor(
             n_poles=n_poles,
         )
     elif algorithm == "tqc":
-        input_dim = 1 + 2 * n_poles
+        input_dim = 2 + 2 * n_poles
         actor = TQCActor(input_dim=input_dim, action_dim=1)
     else:
         raise ValueError(f"unsupported algorithm: {algorithm}")

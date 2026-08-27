@@ -104,7 +104,7 @@ class TQCAgent:
         self.device = (
             torch.device(device) if device else default_training_device()
         )
-        self.state_dim = 1 + 2 * n_poles
+        self.state_dim = 2 + 2 * n_poles
         self.action_dim = 1
         self.n_nets = n_nets
         self.n_quantiles = n_quantiles

@@ -5,7 +5,7 @@ from torch.distributions import Normal
 class ActorNetwork(nn.Module):
     def __init__(self, n_poles=2, action_dim=1):
         super(ActorNetwork, self).__init__()
-        input_dim = 1 + 2 * n_poles
+        input_dim = 2 + 2 * n_poles
         
         # 共享特征提取
         self.net = nn.Sequential(

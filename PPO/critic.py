@@ -4,7 +4,7 @@ import torch.nn as nn
 class CriticNetwork(nn.Module):
     def __init__(self, n_poles=2):
         super(CriticNetwork, self).__init__()
-        input_dim = 1 + 2 * n_poles
+        input_dim = 2 + 2 * n_poles
         
         # 特征提取层
         self.feature_net = nn.Sequential(
