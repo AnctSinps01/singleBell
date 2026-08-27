@@ -1,4 +1,3 @@
-import argparse
 from itertools import product
 from pathlib import Path
 import sys
@@ -19,6 +18,14 @@ from TQC.actor import TQCActor
 from TQC.critics import TQCCritic
 
 
+def default_training_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    return torch.device("cpu")
+
+
 class TQCAgent:
     def __init__(
         self,
@@ -30,13 +37,18 @@ class TQCAgent:
         n_nets=3,
         n_quantiles=25,
         top_quantiles_to_drop=5,
+        action_actor_sync_interval=100,
         device=None,
     ):
         self.gamma = gamma
         self.tau = tau
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = (
+            torch.device(device) if device else default_training_device()
         )
+        if action_actor_sync_interval <= 0:
+            raise ValueError("action_actor_sync_interval must be positive")
+        self.action_actor_sync_interval = action_actor_sync_interval
+        self.update_count = 0
 
         self.state_dim = history_length * (1 + n_poles)
         self.action_dim = 1
@@ -52,6 +64,13 @@ class TQCAgent:
             )
 
         self.actor = TQCActor(self.state_dim, self.action_dim).to(self.device)
+        if self.device.type == "cpu":
+            self.action_actor = self.actor
+        else:
+            self.action_actor = TQCActor(
+                self.state_dim, self.action_dim
+            ).cpu()
+            self.sync_action_actor()
         self.critic = TQCCritic(
             self.state_dim,
             self.action_dim,
@@ -75,6 +94,15 @@ class TQCAgent:
             1, device=self.device, requires_grad=True
         )
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
+
+    def sync_action_actor(self):
+        if self.action_actor is self.actor:
+            return
+        cpu_state = {
+            name: value.detach().cpu()
+            for name, value in self.actor.state_dict().items()
+        }
+        self.action_actor.load_state_dict(cpu_state)
 
     @property
     def alpha(self):
@@ -157,6 +185,7 @@ class TQCAgent:
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.log_alpha.data.copy_(checkpoint["log_alpha"].to(self.device))
         self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
+        self.sync_action_actor()
         return {
             "step": int(checkpoint.get("step", 0)),
             "best_eval_reward": float(
@@ -171,14 +200,12 @@ class TQCAgent:
         }
 
     def select_action(self, state, evaluate=False):
-        state = torch.as_tensor(
-            state, dtype=torch.float32, device=self.device
-        )
+        state = torch.as_tensor(state, dtype=torch.float32, device="cpu")
         if state.ndim in (1, 2):
             state = state.unsqueeze(0)
 
         with torch.no_grad():
-            action = self.actor.act(state, deterministic=evaluate)
+            action = self.action_actor.act(state, deterministic=evaluate)
         return action.squeeze(0).cpu().numpy()
 
     def quantile_huber_loss(self, quantiles, target):
@@ -285,6 +312,10 @@ class TQCAgent:
                 self.critic_target.parameters(), self.critic.parameters()
             ):
                 target_param.lerp_(param, self.tau)
+
+        self.update_count += 1
+        if self.update_count % self.action_actor_sync_interval == 0:
+            self.sync_action_actor()
 
         return {
             "critic_loss": critic_loss.item(),
@@ -434,6 +465,10 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
     
     # 初始化 Agent (对应论文：N=3, M=25)
     agent = TQCAgent(history_length, n_poles, lr=3e-4, gamma=0.99, tau=0.005)
+    print(
+        f"Training device: {agent.device}; "
+        f"action collection device: cpu"
+    )
     
     # 论文设定经验回放池 1e6
     replay_buffer = ReplayBuffer(capacity=1000000)
@@ -499,6 +534,7 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
         # 3. 评估与保存
         if t % eval_interval == 0 and t >= start_steps:
             print("\n--- Running Fixed Angle Evaluation ---")
+            agent.sync_action_actor()
             evaluation = evaluate_agent(
                 agent,
                 eval_env,
@@ -541,13 +577,6 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
                 best_worst_reward=best_worst_reward,
             )
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a TQC agent.")
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--max-steps", type=int, default=2_000_000)
-    return parser.parse_args()
-
 
 if __name__ == "__main__":
-    args = parse_args()
-    train_tqc(resume_path=args.resume, max_steps=args.max_steps)
+    train_tqc(resume_path="TQC/tqc_checkpoint_2.pth", max_steps=2_000_000)
