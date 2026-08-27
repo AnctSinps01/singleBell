@@ -1,6 +1,7 @@
 from itertools import product
 from pathlib import Path
 import sys
+import time
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,6 +55,10 @@ class TQCAgent:
         self.n_quantiles = n_quantiles
         self.top_quantiles_to_drop = top_quantiles_to_drop
         self.total_quantiles = n_nets * n_quantiles
+        self.quantile_tau = (
+            (torch.arange(n_quantiles, device=self.device) + 0.5)
+            / n_quantiles
+        ).view(1, 1, n_quantiles, 1)
 
         if not 0 <= top_quantiles_to_drop < self.total_quantiles:
             raise ValueError(
@@ -235,15 +240,7 @@ class TQCAgent:
         )
         
         # 分位数权重 \tau
-        tau = (
-            torch.arange(
-                self.n_quantiles,
-                dtype=quantiles.dtype,
-                device=quantiles.device,
-            )
-            + 0.5
-        ) / self.n_quantiles
-        tau = tau.view(1, 1, self.n_quantiles, 1)
+        tau = self.quantile_tau.to(dtype=quantiles.dtype)
         
         # 分位数回归损失
         quantile_weight = torch.abs(
@@ -280,7 +277,7 @@ class TQCAgent:
         current_quantiles = self.critic(state, action)
         critic_loss = self.quantile_huber_loss(current_quantiles, target)
         
-        self.critic_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
         
@@ -291,7 +288,7 @@ class TQCAgent:
         actor_q = actor_quantiles.mean(dim=(1, 2), keepdim=False).unsqueeze(1)
         actor_loss = (self.alpha.detach() * log_prob - actor_q).mean()
 
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
         self.critic.requires_grad_(True)
@@ -300,7 +297,7 @@ class TQCAgent:
         alpha_loss = -(
             self.log_alpha * (log_prob + self.target_entropy).detach()
         ).mean()
-        self.alpha_optimizer.zero_grad()
+        self.alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_optimizer.step()
         
@@ -451,7 +448,17 @@ def format_evaluation(result):
     )
 
 
-def train_tqc(resume_path=None, max_steps=2_000_000):
+def train_tqc(
+    resume_path=None,
+    max_steps=2_000_000,
+    batch_size=1024,
+    update_interval=4,
+    log_interval=1000,
+):
+    if batch_size <= 0 or update_interval <= 0 or log_interval <= 0:
+        raise ValueError(
+            "batch_size, update_interval, and log_interval must be positive"
+        )
     SET = Settings()
     n_poles = SET.POLES
     
@@ -469,7 +476,6 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
     # 论文设定经验回放池 1e6
     replay_buffer = ReplayBuffer(capacity=1000000)
 
-    batch_size = 256
     start_steps = 10000 # 初始随机探索步数
     eval_interval = 5000 # 评估间隔步数
 
@@ -492,6 +498,9 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
 
     episode_reward = 0
     episode_length = 0
+    update_count = 0
+    log_started_at = time.perf_counter()
+    log_started_step = initial_step
 
     for t in range(initial_step, max_steps):
         # 1. 探索与收集数据
@@ -520,9 +529,26 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
             episode_reward = 0
             episode_length = 0
             
-        # 2. 网络更新 (每次环境步执行一次更新，论文中 Gradient steps = 1)
-        if len(replay_buffer) >= max(start_steps, batch_size):
+        # 2. 合并多个环境步的样本到一次大批量更新，减少 XPU 调度开销。
+        if (
+            len(replay_buffer) >= max(start_steps, batch_size)
+            and (t + 1) % update_interval == 0
+        ):
             agent.update(replay_buffer, batch_size=batch_size)
+            update_count += 1
+
+        if (t + 1) % log_interval == 0:
+            now = time.perf_counter()
+            elapsed = now - log_started_at
+            completed_steps = t + 1 - log_started_step
+            print(
+                f"Step {t + 1}/{max_steps} | "
+                f"{completed_steps / elapsed:.1f} steps/s | "
+                f"updates={update_count} | buffer={len(replay_buffer)}"
+            )
+            log_started_at = now
+            log_started_step = t + 1
+            update_count = 0
             
         # 3. 评估与保存
         if t % eval_interval == 0 and t >= start_steps:
@@ -571,4 +597,4 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
 
 
 if __name__ == "__main__":
-    train_tqc(max_steps=2_000_000)
+    train_tqc("TQC/tqc_checkpoint_2.pth")

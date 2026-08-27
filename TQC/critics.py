@@ -44,7 +44,14 @@ class TQCCritic(nn.Module):
             raise ValueError("state and action batch sizes must match")
 
         sa = torch.cat([x, action], dim=1)
-        
-        # 收集每个 critic 网络的输出: 最终维度 -> (Batch, n_nets, n_quantiles)
-        quantiles = torch.stack([net(sa) for net in self.nets], dim=1)
+        paired_sa = torch.cat([sa, -sa], dim=0)
+
+        # 对每个分位数做偶对称投影，严格保证 Q(-s, -a) = Q(s, a)。
+        raw_quantiles = torch.stack(
+            [net(paired_sa) for net in self.nets], dim=1
+        )
+        quantiles_pos, quantiles_neg = torch.chunk(
+            raw_quantiles, 2, dim=0
+        )
+        quantiles = 0.5 * (quantiles_pos + quantiles_neg)
         return quantiles

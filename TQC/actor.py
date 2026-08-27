@@ -29,10 +29,19 @@ class TQCActor(nn.Module):
                 f"expected state dimension {self.input_dim}, "
                 f"got {x.size(1)}"
             )
-        net_out = self.net(x)
-        
-        mu = self.mu_layer(net_out)
-        log_std = self.log_std_layer(net_out)
+        # Project an unconstrained network onto the required parity classes.
+        # The policy mean is odd, while its (positive) scale must be even so
+        # that pi(a | s) and pi(-a | -s) are mirror distributions.
+        paired_x = torch.cat([x, -x], dim=0)
+        net_out = self.net(paired_x)
+
+        raw_mu = self.mu_layer(net_out)
+        raw_log_std = self.log_std_layer(net_out)
+        mu_pos, mu_neg = torch.chunk(raw_mu, 2, dim=0)
+        log_std_pos, log_std_neg = torch.chunk(raw_log_std, 2, dim=0)
+
+        mu = 0.5 * (mu_pos - mu_neg)
+        log_std = 0.5 * (log_std_pos + log_std_neg)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         std = torch.exp(log_std)
         
