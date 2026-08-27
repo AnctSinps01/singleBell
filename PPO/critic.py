@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 
 class CriticNetwork(nn.Module):
-    def __init__(self, history_length=4, n_poles=2):
+    def __init__(self, n_poles=2):
         super(CriticNetwork, self).__init__()
-        state_dim = 1 + n_poles
-        input_dim = history_length * state_dim
+        input_dim = 1 + 2 * n_poles
         
         # 特征提取层
         self.feature_net = nn.Sequential(
@@ -36,8 +35,8 @@ class CriticNetwork(nn.Module):
         nn.init.orthogonal_(self.value_head.weight, gain=1.0)
         nn.init.constant_(self.value_head.bias, 0.0)
 
-    def forward(self, state_history):
-        x = state_history.view(state_history.size(0), -1)
+    def forward(self, state):
+        x = state.view(state.size(0), -1)
 
         x_concat = torch.cat([x, -x], dim=0)
         features = self.feature_net(x_concat)

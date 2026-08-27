@@ -5,7 +5,6 @@ import torch.optim as optim
 
 from PPO.actor import ActorNetwork
 from PPO.critic import CriticNetwork
-from frame_stack import FrameStacker
 from environ import NPendulumEnv
 from settings import Settings
 
@@ -14,15 +13,14 @@ class PPOAgent:
 
     def __init__(
         self,
-        history_length=4,
         n_poles=2,
         lr=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_coef=0.1,
     ):
-        self.actor = ActorNetwork(history_length, n_poles)
-        self.critic = CriticNetwork(history_length, n_poles)
+        self.actor = ActorNetwork(n_poles)
+        self.critic = CriticNetwork(n_poles)
 
         try:
             a_checkpoint = torch.load(
@@ -149,7 +147,7 @@ class PPOAgent:
                 self.critic_optimizer.step()
 
 
-def evaluate_agent(agent, env, history_length, n_poles, eval_steps):
+def evaluate_agent(agent, env, n_poles, eval_steps):
     """在 12 个固定角度下评估当前 Agent 的性能
 
     测试角度: 0°, 30°, 60°, ..., 330° (转换为弧度)
@@ -157,9 +155,6 @@ def evaluate_agent(agent, env, history_length, n_poles, eval_steps):
     # 1. 生成 12 个均匀分布的角度 (弧度制)
     test_angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
     total_eval_reward = 0.0
-
-    # 临时创建一个 stacker 避免污染训练的 stacker 数据
-    eval_stacker = FrameStacker(history_length=history_length)
 
     for base_ang in test_angles:
         # env.reset(ang=...) 要求 len(ang) == n_poles
@@ -172,19 +167,16 @@ def evaluate_agent(agent, env, history_length, n_poles, eval_steps):
         # 重置环境到指定角度
         obs = env.reset(ang=ang_vector)
 
-        # 预热 stacker
-        for _ in range(history_length):
-            obs, _ = env.step(0.0)
-            eval_stacker.push(obs)
-
-        state_tensor = eval_stacker.get_stacked_state()
+        state_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
         ep_reward = 0.0
 
         # 在当前角度下运行指定步数
         for _ in range(eval_steps):
             action, _, _ = agent.select_action(state_tensor)
             next_obs, reward = env.step(action)
-            state_tensor = eval_stacker.push(next_obs)
+            state_tensor = torch.as_tensor(
+                next_obs, dtype=torch.float32
+            ).unsqueeze(0)
             ep_reward += reward
 
         total_eval_reward += ep_reward
@@ -197,12 +189,9 @@ def evaluate_agent(agent, env, history_length, n_poles, eval_steps):
 def train_ppo():
     SET = Settings()
     n_poles = SET.POLES
-    history_length = SET.HISTORY
 
     env = NPendulumEnv(n=n_poles)
-    stacker = FrameStacker(history_length=history_length)
     agent = PPOAgent(
-        history_length=history_length,
         n_poles=n_poles,
         lr=3e-4
     )
@@ -213,7 +202,7 @@ def train_ppo():
     global_step = 0
 
     best_eval_reward = evaluate_agent(
-        agent, env, history_length, n_poles, steps_per_update)
+        agent, env, n_poles, steps_per_update)
     print(f"--- Init Score: {best_eval_reward:.4f} ---")
 
 
@@ -229,10 +218,7 @@ def train_ppo():
         iteration_reward = 0
 
         obs = env.reset()
-        for _ in range(history_length):
-            obs, _ = env.step(0.0)
-            stacker.push(obs)
-        state_tensor = stacker.get_stacked_state()
+        state_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
 
         # 步数收集逻辑
         for _ in range(steps_per_update):
@@ -241,7 +227,9 @@ def train_ppo():
 
             # 2. 与环境交互
             next_obs, reward = env.step(action)
-            next_state_tensor = stacker.push(next_obs)
+            next_state_tensor = torch.as_tensor(
+                next_obs, dtype=torch.float32
+            ).unsqueeze(0)
 
             # 3. 记录数据
             rollouts["states"].append(state_tensor)
@@ -272,7 +260,7 @@ def train_ppo():
         if iteration % 100 == 0:
             print("\n--- Running Fixed Angle Evaluation ---")
             current_eval_reward = evaluate_agent(
-                agent, env, history_length, n_poles, steps_per_update)
+                agent, env, n_poles, steps_per_update)
             print(
                 f"Iteration {iteration} \
                 Eval Score: {current_eval_reward:.4f} \

@@ -11,7 +11,6 @@ import torch.optim as optim
 import numpy as np
 
 from environ import NPendulumEnv
-from frame_stack import FrameStacker
 from settings import Settings
 from TQC.buffer import ReplayBuffer
 from TQC.actor import TQCActor
@@ -29,7 +28,6 @@ def default_training_device():
 class TQCAgent:
     def __init__(
         self,
-        history_length,
         n_poles,
         lr=3e-4,
         gamma=0.99,
@@ -50,7 +48,7 @@ class TQCAgent:
         self.action_actor_sync_interval = action_actor_sync_interval
         self.update_count = 0
 
-        self.state_dim = history_length * (1 + n_poles)
+        self.state_dim = 1 + 2 * n_poles
         self.action_dim = 1
         self.n_nets = n_nets
         self.n_quantiles = n_quantiles
@@ -201,7 +199,7 @@ class TQCAgent:
 
     def select_action(self, state, evaluate=False):
         state = torch.as_tensor(state, dtype=torch.float32, device="cpu")
-        if state.ndim in (1, 2):
+        if state.ndim == 1:
             state = state.unsqueeze(0)
 
         with torch.no_grad():
@@ -358,19 +356,17 @@ def build_evaluation_cases(
 def evaluate_agent(
     agent,
     env,
-    history_length,
     n_poles,
     eval_steps=500,
     success_window=100,
 ):
     """在固定初态集上评估回零性能，返回奖励和控制质量指标。"""
     cases = build_evaluation_cases(n_poles)
-    eval_stacker = FrameStacker(history_length=history_length)
     episodes = []
 
     for suite, angles in cases:
         obs = env.reset(ang=angles.tolist())
-        state_tensor = eval_stacker.reset(obs)
+        state_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
         rewards = []
         actions = []
         stable = []
@@ -378,7 +374,9 @@ def evaluate_agent(
         for _ in range(eval_steps):
             action = agent.select_action(state_tensor, evaluate=True).item()
             next_obs, reward = env.step(action)
-            state_tensor = eval_stacker.push(next_obs)
+            state_tensor = torch.as_tensor(
+                next_obs, dtype=torch.float32
+            ).unsqueeze(0)
             rewards.append(reward)
             actions.append(abs(action))
             stable.append(
@@ -456,15 +454,13 @@ def format_evaluation(result):
 def train_tqc(resume_path=None, max_steps=2_000_000):
     SET = Settings()
     n_poles = SET.POLES
-    history_length = SET.HISTORY
     
     # 初始化环境
     env = NPendulumEnv(n=n_poles)
     eval_env = NPendulumEnv(n=n_poles)
-    stacker = FrameStacker(history_length=history_length)
     
     # 初始化 Agent (对应论文：N=3, M=25)
-    agent = TQCAgent(history_length, n_poles, lr=3e-4, gamma=0.99, tau=0.005)
+    agent = TQCAgent(n_poles, lr=3e-4, gamma=0.99, tau=0.005)
     print(
         f"Training device: {agent.device}; "
         f"action collection device: cpu"
@@ -480,8 +476,7 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
     model_dir = Path(__file__).resolve().parent
     actor_path = model_dir / f"tqc_actor_{n_poles}.pth"
     checkpoint_path = model_dir / f"tqc_checkpoint_{n_poles}.pth"
-    obs = env.reset()
-    state = stacker.reset(obs).squeeze(0).numpy()
+    state = env.reset()
 
     best_eval_reward = -float('inf')
     best_success_rate = -1.0
@@ -507,8 +502,7 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
             action = agent.select_action(state_tensor, evaluate=False).item()
             
         next_obs, reward = env.step(action)
-        stacker.push(next_obs)
-        next_state = stacker.get_stacked_state().squeeze(0).numpy()
+        next_state = next_obs
         
         # 在连续控制中通常不存在自然 done（除非你想设置跌倒 done）
         # 这里统一当做 0 处理 (由于是转移控制，理论上系统一直运行)
@@ -522,8 +516,7 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
         
         # 为了与 PPO 代码一致，这里强制每 1000 步重置一次环境（可自定义）
         if episode_length >= 1000:
-            obs = env.reset()
-            state = stacker.reset(obs).squeeze(0).numpy()
+            state = env.reset()
             episode_reward = 0
             episode_length = 0
             
@@ -538,7 +531,6 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
             evaluation = evaluate_agent(
                 agent,
                 eval_env,
-                history_length,
                 n_poles,
             )
             current_eval_reward = evaluation["mean_reward"]
@@ -579,4 +571,4 @@ def train_tqc(resume_path=None, max_steps=2_000_000):
 
 
 if __name__ == "__main__":
-    train_tqc(resume_path="TQC/tqc_checkpoint_2.pth", max_steps=2_000_000)
+    train_tqc(max_steps=2_000_000)

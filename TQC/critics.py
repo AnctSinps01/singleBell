@@ -32,7 +32,7 @@ class TQCCritic(nn.Module):
 
         if x.size(1) != self.state_dim:
             raise ValueError(
-                f"expected flattened state dimension {self.state_dim}, "
+                f"expected state dimension {self.state_dim}, "
                 f"got {x.size(1)}"
             )
         if action.size(1) != self.action_dim:

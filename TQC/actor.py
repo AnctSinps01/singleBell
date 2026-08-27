@@ -22,11 +22,11 @@ class TQCActor(nn.Module):
         self.log_std_min = -20.0
 
     def forward(self, state):
-        # Flatten state: (Batch, History, Features) -> (Batch, Input_dim)
+        # Accept a batch of instantaneous full-state observations.
         x = state.reshape(state.size(0), -1)
         if x.size(1) != self.input_dim:
             raise ValueError(
-                f"expected flattened state dimension {self.input_dim}, "
+                f"expected state dimension {self.input_dim}, "
                 f"got {x.size(1)}"
             )
         net_out = self.net(x)

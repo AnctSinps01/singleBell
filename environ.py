@@ -147,4 +147,5 @@ class NPendulumEnv:
         return obs, reward
         
     def _get_obs(self) -> np.ndarray:
-        return np.copy(self.q)
+        # Current cart/pole positions plus each pole's angular velocity.
+        return np.concatenate((self.q, self.dq[1:])).copy()

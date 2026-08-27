@@ -12,7 +12,6 @@ from matplotlib.patches import Rectangle
 
 from PPO.actor import ActorNetwork
 from TQC.actor import TQCActor
-from frame_stack import FrameStacker
 from environ import NPendulumEnv
 
 
@@ -20,7 +19,6 @@ from environ import NPendulumEnv
 ALGORITHM = "tqc"       # "ppo" 或 "tqc"
 ACTOR_PATH = None        # None: 自动选择对应算法的权重；也可填写 Path("...")
 N_POLES = 2
-HISTORY_LENGTH = 6       # 必须与训练该权重时的 HISTORY 一致
 DETERMINISTIC = True     # True: 均值动作；False: 随机采样动作
 MAX_STEPS = 2000
 # ==============================================================
@@ -49,7 +47,6 @@ class Policy:
 def load_actor(
     algorithm,
     actor_path,
-    history_length=4,
     n_poles=2,
     device="cpu",
 ):
@@ -57,11 +54,10 @@ def load_actor(
     algorithm = algorithm.lower()
     if algorithm == "ppo":
         actor = ActorNetwork(
-            history_length=history_length,
             n_poles=n_poles,
         )
     elif algorithm == "tqc":
-        input_dim = history_length * (1 + n_poles)
+        input_dim = 1 + 2 * n_poles
         actor = TQCActor(input_dim=input_dim, action_dim=1)
     else:
         raise ValueError(f"unsupported algorithm: {algorithm}")
@@ -156,7 +152,6 @@ def run_inference(
     actor_path,
     algorithm="ppo",
     n_poles=2,
-    history_length=4,
     deterministic=True,
     max_steps=2000,
 ):
@@ -171,14 +166,12 @@ def run_inference(
     policy = load_actor(
         algorithm,
         actor_path,
-        history_length,
         n_poles,
         device,
     )
 
-    # 2. 初始化环境与帧堆叠器
+    # 2. 初始化环境
     env = NPendulumEnv(n=n_poles)
-    stacker = FrameStacker(history_length=history_length)
 
     # 3. 设置 matplotlib
     plt.ion()  # 交互模式
@@ -193,7 +186,7 @@ def run_inference(
 
     # 4. 状态变量
     obs = env.reset()
-    state_tensor = stacker.reset(obs)
+    state_tensor = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
     episode_reward = 0.0
     step_count = 0
     print(f"Starting inference for fixed {max_steps} steps... Close the plot window to exit early.")
@@ -204,7 +197,9 @@ def run_inference(
 
         # --- 环境步进 (直接忽略 returned done 标志) ---
         next_obs, reward = env.step(action)
-        next_state_tensor = stacker.push(next_obs)
+        next_state_tensor = torch.as_tensor(
+            next_obs, dtype=torch.float32
+        ).unsqueeze(0)
 
         episode_reward += reward
         step_count += 1
@@ -255,8 +250,6 @@ def validate_config():
         raise ValueError("ALGORITHM 必须是 'ppo' 或 'tqc'")
     if N_POLES < 1:
         raise ValueError("N_POLES 必须大于等于 1")
-    if HISTORY_LENGTH < 1:
-        raise ValueError("HISTORY_LENGTH 必须大于等于 1")
     if MAX_STEPS < 1:
         raise ValueError("MAX_STEPS 必须大于等于 1")
 
@@ -276,13 +269,12 @@ if __name__ == "__main__":
     algorithm, actor_path = validate_config()
     print(
         f"Algorithm: {algorithm.upper()} | Actor: {actor_path} | "
-        f"Poles: {N_POLES} | History: {HISTORY_LENGTH}"
+        f"Poles: {N_POLES}"
     )
     run_inference(
         actor_path=actor_path,
         algorithm=algorithm,
         n_poles=N_POLES,
-        history_length=HISTORY_LENGTH,
         deterministic=DETERMINISTIC,
         max_steps=MAX_STEPS,
     )
