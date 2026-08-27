@@ -60,5 +60,101 @@ class ReplayBuffer:
             torch.as_tensor(self.dones[indices], device=device),
         )
 
+    def state_dict(self):
+        if self.states is None:
+            return {
+                "capacity": self.capacity,
+                "size": 0,
+                "position": 0,
+                "states": None,
+                "actions": None,
+                "rewards": None,
+                "next_states": None,
+                "dones": None,
+            }
+
+        stored = self.capacity if self.size == self.capacity else self.size
+        return {
+            "capacity": self.capacity,
+            "size": self.size,
+            "position": self.position,
+            "states": self.states[:stored].copy(),
+            "actions": self.actions[:stored].copy(),
+            "rewards": self.rewards[:stored].copy(),
+            "next_states": self.next_states[:stored].copy(),
+            "dones": self.dones[:stored].copy(),
+        }
+
+    def load_state_dict(self, state):
+        required = {
+            "capacity",
+            "size",
+            "position",
+            "states",
+            "actions",
+            "rewards",
+            "next_states",
+            "dones",
+        }
+        missing = required.difference(state)
+        if missing:
+            raise ValueError(
+                f"replay buffer state is missing fields: {sorted(missing)}"
+            )
+
+        capacity = int(state["capacity"])
+        size = int(state["size"])
+        position = int(state["position"])
+        if capacity != self.capacity:
+            raise ValueError(
+                f"replay buffer capacity mismatch: {capacity} != "
+                f"{self.capacity}"
+            )
+        if not 0 <= size <= capacity:
+            raise ValueError("invalid replay buffer size")
+        if not 0 <= position < capacity:
+            raise ValueError("invalid replay buffer position")
+
+        if size == 0:
+            if any(state[name] is not None for name in required - {
+                "capacity", "size", "position"
+            }):
+                raise ValueError("empty replay buffer contains transition data")
+            self.size = 0
+            self.position = 0
+            self.states = None
+            self.actions = None
+            self.next_states = None
+            return
+
+        arrays = {
+            name: np.asarray(state[name], dtype=np.float32)
+            for name in (
+                "states",
+                "actions",
+                "rewards",
+                "next_states",
+                "dones",
+            )
+        }
+        stored = capacity if size == capacity else size
+        if any(array.shape[0] != stored for array in arrays.values()):
+            raise ValueError("replay buffer arrays have inconsistent lengths")
+        if arrays["states"].shape != arrays["next_states"].shape:
+            raise ValueError("state and next-state shapes do not match")
+        if arrays["rewards"].shape != (stored, 1):
+            raise ValueError("rewards must have shape (stored, 1)")
+        if arrays["dones"].shape != (stored, 1):
+            raise ValueError("dones must have shape (stored, 1)")
+
+        self._allocate(arrays["states"][0], arrays["actions"][0])
+        self.states[:stored] = arrays["states"]
+        self.actions[:stored] = arrays["actions"]
+        self.rewards[:stored] = arrays["rewards"]
+        self.next_states[:stored] = arrays["next_states"]
+        self.dones[:stored] = arrays["dones"]
+        self.size = size
+        self.position = position
+
     def __len__(self):
         return self.size

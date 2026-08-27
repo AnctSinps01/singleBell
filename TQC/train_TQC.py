@@ -1,5 +1,6 @@
 from itertools import product
 from pathlib import Path
+import random
 import sys
 import time
 
@@ -16,6 +17,66 @@ from settings import Settings
 from TQC.buffer import ReplayBuffer
 from TQC.actor import TQCActor
 from TQC.critics import TQCCritic
+
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    if (
+        hasattr(torch, "xpu")
+        and torch.xpu.is_available()
+        and hasattr(torch.xpu, "get_rng_state_all")
+    ):
+        state["torch_xpu"] = torch.xpu.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint requires CUDA RNG state")
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if "torch_xpu" in state:
+        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+            raise RuntimeError("checkpoint requires XPU RNG state")
+        torch.xpu.set_rng_state_all(state["torch_xpu"])
+
+
+def atomic_torch_save(value, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    torch.save(value, temporary_path)
+    temporary_path.replace(path)
+
+
+def environment_state_dict(env):
+    return {
+        "n": env.n,
+        "q": env.q.copy(),
+        "dq": env.dq.copy(),
+    }
+
+
+def load_environment_state(env, state):
+    if int(state["n"]) != env.n:
+        raise ValueError(
+            f"environment pole count mismatch: {state['n']} != {env.n}"
+        )
+    q = np.asarray(state["q"], dtype=np.float64)
+    dq = np.asarray(state["dq"], dtype=np.float64)
+    if q.shape != env.q.shape or dq.shape != env.dq.shape:
+        raise ValueError("checkpoint environment state has invalid shape")
+    env.q[...] = q
+    env.dq[...] = dq
 
 
 def default_training_device():
@@ -117,9 +178,10 @@ class TQCAgent:
         best_eval_reward,
         best_success_rate=-1.0,
         best_worst_reward=-float("inf"),
+        training_state=None,
     ):
         return {
-            "version": 1,
+            "version": 2,
             "step": int(step),
             "best_eval_reward": float(best_eval_reward),
             "best_success_rate": float(best_success_rate),
@@ -132,14 +194,24 @@ class TQCAgent:
                 "top_quantiles_to_drop": self.top_quantiles_to_drop,
                 "gamma": self.gamma,
                 "tau": self.tau,
+                "target_entropy": self.target_entropy,
+                "action_actor_sync_interval": (
+                    self.action_actor_sync_interval
+                ),
             },
             "actor": self.actor.state_dict(),
+            "action_actor": {
+                name: value.detach().cpu()
+                for name, value in self.action_actor.state_dict().items()
+            },
             "critic": self.critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(),
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
+            "agent_update_count": self.update_count,
+            "training_state": training_state,
         }
 
     def save_checkpoint(
@@ -149,15 +221,17 @@ class TQCAgent:
         best_eval_reward,
         best_success_rate=-1.0,
         best_worst_reward=-float("inf"),
+        training_state=None,
     ):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        if training_state is None:
+            raise ValueError("complete checkpoint requires training_state")
+        atomic_torch_save(
             self.checkpoint_state(
                 step,
                 best_eval_reward,
                 best_success_rate,
                 best_worst_reward,
+                training_state,
             ),
             path,
         )
@@ -166,12 +240,23 @@ class TQCAgent:
         checkpoint = torch.load(
             path, map_location=self.device, weights_only=False
         )
+        if checkpoint.get("version") != 2:
+            raise ValueError(
+                "checkpoint does not contain complete training state"
+            )
+        if checkpoint.get("training_state") is None:
+            raise ValueError("checkpoint is missing training_state")
         config = checkpoint.get("agent_config", {})
         expected = {
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
             "n_nets": self.n_nets,
             "n_quantiles": self.n_quantiles,
+            "top_quantiles_to_drop": self.top_quantiles_to_drop,
+            "gamma": self.gamma,
+            "tau": self.tau,
+            "target_entropy": self.target_entropy,
+            "action_actor_sync_interval": self.action_actor_sync_interval,
         }
         mismatches = {
             key: (config.get(key), value)
@@ -188,7 +273,8 @@ class TQCAgent:
         self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
         self.log_alpha.data.copy_(checkpoint["log_alpha"].to(self.device))
         self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
-        self.sync_action_actor()
+        self.update_count = int(checkpoint["agent_update_count"])
+        self.action_actor.load_state_dict(checkpoint["action_actor"])
         return {
             "step": int(checkpoint.get("step", 0)),
             "best_eval_reward": float(
@@ -200,6 +286,7 @@ class TQCAgent:
             "best_worst_reward": float(
                 checkpoint.get("best_worst_reward", -float("inf"))
             ),
+            "training_state": checkpoint["training_state"],
         }
 
     def select_action(self, state, evaluate=False):
@@ -490,15 +577,37 @@ def train_tqc(
     initial_step = 0
     if resume_path is not None:
         resume_state = agent.load_checkpoint(resume_path)
+        training_state = resume_state["training_state"]
+        saved_config = training_state["training_config"]
+        current_config = {
+            "batch_size": batch_size,
+            "update_interval": update_interval,
+            "start_steps": start_steps,
+            "eval_interval": eval_interval,
+        }
+        if saved_config != current_config:
+            raise ValueError(
+                "training configuration mismatch: "
+                f"checkpoint={saved_config}, current={current_config}"
+            )
+        replay_buffer.load_state_dict(training_state["replay_buffer"])
+        load_environment_state(env, training_state["environment"])
+        state = np.asarray(training_state["state"], dtype=np.float64).copy()
+        if state.shape != env._get_obs().shape:
+            raise ValueError("checkpoint observation has invalid shape")
         initial_step = resume_state["step"]
         best_eval_reward = resume_state["best_eval_reward"]
         best_success_rate = resume_state["best_success_rate"]
         best_worst_reward = resume_state["best_worst_reward"]
+        episode_reward = float(training_state["episode_reward"])
+        episode_length = int(training_state["episode_length"])
+        update_count = int(training_state["log_update_count"])
+        restore_rng_state(training_state["rng_state"])
         print(f"Resumed TQC checkpoint at step {initial_step}.")
-
-    episode_reward = 0
-    episode_length = 0
-    update_count = 0
+    else:
+        episode_reward = 0.0
+        episode_length = 0
+        update_count = 0
     log_started_at = time.perf_counter()
     log_started_step = initial_step
 
@@ -580,7 +689,7 @@ def train_tqc(
                 best_success_rate = evaluation["success_rate"]
                 best_eval_reward = current_eval_reward
                 best_worst_reward = evaluation["worst_reward"]
-                torch.save(agent.actor.state_dict(), actor_path)
+                atomic_torch_save(agent.actor.state_dict(), actor_path)
                 print(
                     ">>> New best actor saved: "
                     f"success={best_success_rate:.1%}, "
@@ -593,8 +702,24 @@ def train_tqc(
                 best_eval_reward=best_eval_reward,
                 best_success_rate=best_success_rate,
                 best_worst_reward=best_worst_reward,
+                training_state={
+                    "training_config": {
+                        "batch_size": batch_size,
+                        "update_interval": update_interval,
+                        "start_steps": start_steps,
+                        "eval_interval": eval_interval,
+                    },
+                    "replay_buffer": replay_buffer.state_dict(),
+                    "environment": environment_state_dict(env),
+                    "state": np.asarray(state, dtype=np.float64).copy(),
+                    "episode_reward": episode_reward,
+                    "episode_length": episode_length,
+                    "log_update_count": update_count,
+                    "rng_state": capture_rng_state(),
+                },
             )
 
 
 if __name__ == "__main__":
-    train_tqc("TQC/tqc_checkpoint_2.pth")
+    # train_tqc("TQC/tqc_checkpoint_2.pth")
+    train_tqc()
