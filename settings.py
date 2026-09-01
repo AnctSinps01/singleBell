@@ -1,3 +1,3 @@
 class Settings:
     def __init__(self):
-        self.POLES = 2
+        self.POLES = 3

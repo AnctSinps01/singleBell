@@ -13,12 +13,14 @@ from matplotlib.patches import Rectangle
 from PPO.actor import ActorNetwork
 from TQC.actor import TQCActor
 from environ import NPendulumEnv
+from settings import Settings
 
 
 # ==================== 推理配置：直接修改这里 ====================
+ST = Settings()
 ALGORITHM = "tqc"       # "ppo" 或 "tqc"
 ACTOR_PATH = None        # None: 自动选择对应算法的权重；也可填写 Path("...")
-N_POLES = 2
+N_POLES = ST.POLES
 DETERMINISTIC = True     # True: 均值动作；False: 随机采样动作
 MAX_STEPS = 2000
 # ==============================================================
